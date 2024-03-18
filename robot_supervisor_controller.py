@@ -145,19 +145,31 @@ class RobotSupervisorController(RobotSupervisorEnv):
         # normalized value for position, velocity, acceleration, orientation and lidar_readings
         self.min_val, self.max_val = 0.0, 1.0
 
-        # Apparition points
-        dt = np.dtype([('position', np.float32, (3,)), ('rotation', np.float32, (4,))])
-        self.appearance_points = np.array([
-            ((-1.68, -2.68, 0.036), (0, 0, 1, 0)),
-            ((1.77916, -2.90669, 0.036), (0, 0, 1, 0.785391)),
-        ], dtype=dt)
+        # Apparition points by tracks
+        self.tracks = {
+            1: [((-1.68, -2.68, 0.036), (0, 0, 1, 0), False),
+                ((1.77916, -2.90669, 0.036), (0, 0, 1, 0.785391), False)],
+            2: [((0, -13.9975, 0.04), (0, 0, 1, 0), False),
+                ((-2, -11, 0.04), (0, 0, 1, -2.0944), False)],
+            3: [((10, -1.9975, 0.04), (0, 0, 1, 0), False),
+                ((8, 1.9975, 0.04), (0, 0, 1, -2.0944), False)]
+        }
+        # Mapping apparition points to defined waypoint number name ([0]: normal direction, [1]: reverse direction)
+        self.waypoint_mapping = {
+            "1_1": [3, 4],
+            "1_2": [3, 3],
+            "2_1": [4, 4],
+            "2_2": [2, 1],
+            "3_1": [3, 5],
+            "3_2": [2, 1],
+        }
+
+        self.X_train = [2]
+        self.track_id, self.apparition_point, self.current_waypoint, self.reverse_direction = self.initialize_agent(self.X_train)
         self.setup_agent()
 
         # Track waypoints
-        self.track_number = 1
-        self.n_waypoints = 4
-        self.waypoints = self.initialize_waypoints(self.track_number)
-        self.current_waypoint_index = 2
+        self.waypoints = self.initialize_waypoints(self.track_id, self.reverse_direction)
 
         self.previous_position = self.get_position()
         self.last_action = None
@@ -177,12 +189,11 @@ class RobotSupervisorController(RobotSupervisorEnv):
         self.max_angle = 360  # lidar max wanted angle
         self.lidar_min_range = self.lidar.getMinRange()
         self.lidar_max_range = self.lidar.getMaxRange()
-        self.N = 400  # reduced number of LiDAR points after SampleNet
 
         # Set up gymnasium spaces
-        self.include_previous_observation = False
+        self.include_previous_observation = True
         self.n_hist_obs = 2  # number of observation history
-        self.include_previous_action = False
+        self.include_previous_action = True
         self.n_hist_act = 2  # number of action history
 
         # Buffers for past observations and actions
@@ -194,8 +205,8 @@ class RobotSupervisorController(RobotSupervisorEnv):
         max_act = self.max_val * np.ones(2, dtype=np.float32)
         self.action_space = Box(low=low_act, high=max_act, dtype=np.float32)
 
-        # Base observation dimensions: pos(2,) + vel(2,) + acc(2,) + ori(2,) + lidar_points(N*2,)
-        base_obs_dim = 2 + 2 + 2 + 2 + (self.N * 2)
+        # Base observation dimensions: pos(2,) + vel(2,) + acc(2,) + ori(2,) + lidar_points(lidarhorizontalresolution*2,)
+        base_obs_dim = 2 + 2 + 2 + 2 + (int(self.lidar.getHorizontalResolution()) * 2)
 
         # Calculate total observation dimensions
         total_obs_dim = base_obs_dim
@@ -205,8 +216,8 @@ class RobotSupervisorController(RobotSupervisorEnv):
             total_obs_dim += (2 * self.n_hist_act)  # Assuming action space is 2D
 
         # Define bounds
-        low_bounds = np.array([-self.max_val] * 8 + [self.min_val] * (self.N * 2), dtype=np.float32)
-        high_bounds = np.array([self.max_val] * 8 + [self.max_val] * (self.N * 2), dtype=np.float32)
+        low_bounds = np.array([-self.max_val] * 8 + [self.min_val] * (int(self.lidar.getHorizontalResolution()) * 2), dtype=np.float32)
+        high_bounds = np.array([self.max_val] * 8 + [self.max_val] * (int(self.lidar.getHorizontalResolution()) * 2), dtype=np.float32)
 
         if self.include_previous_observation:
             for _ in range(self.n_hist_obs):
@@ -239,6 +250,81 @@ class RobotSupervisorController(RobotSupervisorEnv):
         # Logging
         self.max_distance_driven = 0.0
         self.distance_driven = 0.0
+
+    def initialize_agent(self, X):
+        # Select a random track ID from X_train using NumPy for efficiency
+        track_id = np.random.choice(X)
+        track_info = self.tracks[track_id]
+
+        # Select a random apparition point
+        apparition_point_index = np.random.randint(len(track_info))
+        print("Apparition point index:", apparition_point_index)
+        apparition_point = track_info[apparition_point_index]
+
+        # Randomly decide on the direction and adjust angle if necessary
+        reverse_direction = np.random.choice([True, False])
+        if reverse_direction:
+            apparition_point = (apparition_point[0], (
+            apparition_point[1][0], apparition_point[1][1], apparition_point[1][2], apparition_point[1][3]+3.142),
+                                reverse_direction)
+
+        # Determine the current waypoint based on the track_id and apparition_point_index
+        waypoint_key = f"{track_id}_{apparition_point_index + 1}"  # +1 if indexing starts at 1 for mapping
+        print("Waypoint key:", waypoint_key)
+        current_waypoint = self.waypoint_mapping[waypoint_key][int(reverse_direction)]
+
+        return track_id, apparition_point, current_waypoint, reverse_direction
+
+    def setup_agent(self):
+        """
+        This method initializes the position of the robot, storing the references inside a list and setting the starting
+        positions and velocities.
+        """
+        trans_field = self.getSelf().getField("translation")
+        rot_field = self.getSelf().getField("rotation")
+        print(self.apparition_point)
+        position, rotation, _ = self.apparition_point
+        trans_field.setSFVec3f(np.array(position).tolist())
+        rot_field.setSFRotation(np.array(rotation).tolist())
+        self.getSelf().resetPhysics()
+
+    def initialize_waypoints(self, track_number, reverse_direction):
+        """
+        Dynamically initialize the positions, size, and orientation of the waypoints for the given track,
+        iterating until no further waypoints are found.
+        """
+        waypoints = []
+        i = 1
+        while True:
+            # Construct the waypoint name, considering the reverse direction if necessary
+            waypoint_suffix = "_Rev" if reverse_direction else ""
+            waypoint_name = f"WAYPOINT_{i}{waypoint_suffix}({track_number})"
+            # Attempt to fetch the waypoint node using the Webots API
+            waypoint_node = self.getFromDef(waypoint_name)
+            if waypoint_node is None:
+                break
+
+            translation_field = waypoint_node.getField('translation')
+            position = translation_field.getSFVec3f() if translation_field else [0, 0, 0]
+
+            bounding_object_field = waypoint_node.getField('boundingObject')
+            size = [0, 0]
+            if bounding_object_field:
+                box_node = bounding_object_field.getSFNode()
+                if box_node:
+                    size_field = box_node.getField('size')
+                    size = size_field.getSFVec3f()[:2] if size_field else [0, 0]
+
+            rotation_field = waypoint_node.getField('rotation')
+            orientation = rotation_field.getSFRotation() if rotation_field else [0, 0, 1, 0]
+
+            waypoints.append({
+                'position': position,
+                'size': size,
+                'orientation': orientation
+            })
+            i += 1
+        return waypoints
 
     def initialize_buffers(self):
         # Fill the past observations buffer with initial values
@@ -356,7 +442,7 @@ class RobotSupervisorController(RobotSupervisorEnv):
 
         # Calculate angles for each LiDAR point
         # Assuming the LiDAR has a field of view from min_angle to max_angle
-        angles = np.linspace(self.min_angle, self.max_angle, self.N, dtype=np.float32)
+        angles = np.linspace(self.min_angle, self.max_angle, int(self.lidar.getHorizontalResolution()), dtype=np.float32)
 
         # Convert angles from degrees to radians if necessary
         # angles_rad = np.deg2rad(angles)
@@ -412,69 +498,32 @@ class RobotSupervisorController(RobotSupervisorEnv):
         # Update previous position for the next call
         self.previous_position = current_position
 
-    def setup_agent(self):
-        """
-        This method initializes the position of the robot, storing the references inside a list and setting the starting
-        positions and velocities.
-        """
-        trans_field = self.getSelf().getField("translation")
-        rot_field = self.getSelf().getField("rotation")
-        position, rotation = self.np_random.choice(self.appearance_points)
-        trans_field.setSFVec3f(np.array(position).tolist())
-        rot_field.setSFRotation(np.array(rotation).tolist())
-        self.getSelf().resetPhysics()
-
-    def initialize_waypoints(self, track_number):
-        """
-        Initialize the positions, size and orientation of the waypoints.
-        """
-        waypoints = []
-        for i in range(1, self.n_waypoints + 1):
-            waypoint_name = f'WAYPOINT_{i}({track_number})'
-            waypoint_node = self.getFromDef(waypoint_name)  # Get the node using Webots API
-            if waypoint_node is not None:
-
-                translation_field = waypoint_node.getField('translation')
-                position = translation_field.getSFVec3f() if translation_field else [0, 0, 0]
-
-                bounding_object_field = waypoint_node.getField('boundingObject')
-                if bounding_object_field:
-                    box_node = bounding_object_field.getSFNode()
-                    if box_node:
-                        size_field = box_node.getField('size')
-                        size = size_field.getSFVec3f()[:2] if size_field else [0, 0]
-                    else:
-                        size = [0, 0]
-                else:
-                    size = [0, 0]
-
-                rotation_field = waypoint_node.getField('rotation')
-                orientation = rotation_field.getSFRotation() if rotation_field else [0, 0, 1, 0]
-
-                waypoints.append({
-                    'position': position,
-                    'size': size,
-                    'orientation': orientation
-                })
-        return waypoints
-
     def get_next_waypoint(self):
         """
-        Get the position of the next waypoint.
+        Get the information about the current waypoint, using `self.current_waypoint`
+        as an index into the dynamically initialized `self.waypoints` list.
         """
-        if self.current_waypoint_index < len(self.waypoints):
-            return self.waypoints[self.current_waypoint_index]
+        # Adjust for 0-based indexing
+        index = self.current_waypoint - 1
+        print(self.current_waypoint)
+
+        # Ensure there's a valid index
+        if 0 <= index < len(self.waypoints):
+            return self.waypoints[index]
+        return None  # Return None if no valid current waypoint
 
     def update_waypoint_target(self):
         """
-        Update the target waypoint index after reaching a waypoint.
-        Loops back to the first waypoint after the last one is reached.
+        Increment `self.current_waypoint` to target the next waypoint.
+        Loops back to the first waypoint if the end of the waypoints list is reached.
         """
-        if self.current_waypoint_index < len(self.waypoints) - 1:
-            self.current_waypoint_index += 1
-        else:
-            # Loop back to the first waypoint after the last one is reached
-            self.current_waypoint_index = 0
+        # Increment the current waypoint
+        self.current_waypoint += 1
+
+        # Check if the incremented waypoint exceeds the number of waypoints discovered
+        # If so, loop back to the first waypoint
+        if self.current_waypoint - 1 >= len(self.waypoints):
+            self.current_waypoint = 1  # Loop back, accounting for 1-based numbering
 
     def get_closest_point_on_line(self, agent_position, cur_waypoint):
         """
@@ -557,6 +606,7 @@ class RobotSupervisorController(RobotSupervisorEnv):
         reach_tar_reward = 0.0
         if distance_to_waypoint < self.on_target_threshold:
             reach_tar_reward = 1.0 - 0.5 * self.timestep / self.time_limit  # timestep in ms
+            self.update_waypoint_target()
         reward += reach_tar_reward
         self.r_dict['Reach W rew'] = reward
 
@@ -595,12 +645,13 @@ class RobotSupervisorController(RobotSupervisorEnv):
         if position[2] < -0.5 or position[2] > 0.5:
             print("Sortie de piste !!!")
             return True
-        # Check the rotation termination condition.
-        rot_field = self.getSelf().getField("rotation")
-        rotation = rot_field.getSFRotation()
-        if 2 <= rotation[3] <= 4:
-            print("Agent retourné !!!")
-            return True
+        # # Check the rotation termination condition.
+        # rot_field = self.getSelf().getField("rotation")
+        # rotation = rot_field.getSFRotation()
+        # if 0.95 <= rotation[2] <= 1:
+        #     if 2 <= rotation[3] <= 4 :
+        #         print("Agent retourné !!!")
+        #         return True
         if len(self.episode_score_list) >= 100:
             average_score = np.mean(self.episode_score_list[-100:])
         else:
@@ -628,12 +679,13 @@ class RobotSupervisorController(RobotSupervisorEnv):
         # self.simulationReset()
         self.simulationResetPhysics()
         self.r_dict = {}
-        self.current_waypoint_index = 2
         self.collision_state = False
+        self.track_id, self.apparition_point, self.current_waypoint, self.reverse_direction = self.initialize_agent(
+            self.X_train)
         self.setup_agent()
         self.previous_position = self.get_position()
         self.distance_driven = 0.0
-        self.waypoints = self.initialize_waypoints(track_number=self.track_number)
+        self.waypoints = self.initialize_waypoints(track_number=self.track_id, reverse_direction=self.reverse_direction)
         #super(Supervisor, self).step(4*int(self.car.getBasicTimeStep()))
         print("reset")
         self.past_observations = deque(maxlen=self.n_hist_obs)

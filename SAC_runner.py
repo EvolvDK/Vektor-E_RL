@@ -55,7 +55,7 @@ def get_args() -> argparse.Namespace:
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
-    parser.add_argument("--resume-path", type=str, default="log./VektorE-v0/sac/0/240316-1916858/policy.pth")
+    parser.add_argument("--resume-path", type=str, default="log./VektorE-v0/sac/0/240317-204900/policy.pth")
     parser.add_argument("--resume-id", type=str, default=None)
     parser.add_argument(
         "--logger",
@@ -88,7 +88,7 @@ def test_sac(args: argparse.Namespace = get_args()) -> None:
         args.test_num,
         obs_norm=False,
     )
-    env = TimeLimit(env, max_episode_steps=2000)
+    env = TimeLimit(env, max_episode_steps=1000)
     # env = FlattenObservation(env)
     args.state_shape = env.observation_space.shape or env.observation_space.n
     args.action_shape = env.action_space.shape or env.action_space.n
